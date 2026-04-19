@@ -1,0 +1,396 @@
+"""
+Fine-tune FinancialBERT using weak supervision (Path A).
+
+Pipeline:
+  1. Load the 21K normalized news headlines.
+  2. Take a stratified sample (~3000 rows) across tag/source.
+  3. Auto-label with a zero-shot model (BART-MNLI) to create pseudo-labels.
+  4. Filter low-confidence labels.
+  5. Fine-tune FinancialBERT on the pseudo-labeled set.
+  6. Evaluate: fine-tuned model vs. off-the-shelf FinancialBERT on a held-out slice.
+  7. Score ALL 21K headlines with the best model and save daily aggregates.
+
+Run:
+    pip install transformers datasets torch scikit-learn pandas numpy accelerate
+    python finetune_financialbert.py
+
+Hardware note:
+  - GPU strongly recommended. On CPU, zero-shot labeling of 3K rows takes ~30 min;
+    fine-tuning 3 epochs takes ~1-2 hours. On a T4/A100, both finish in minutes.
+  - If you have no GPU, reduce SAMPLE_SIZE to 1000 and EPOCHS to 2.
+"""
+
+from __future__ import annotations
+
+import os
+import random
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from datasets import Dataset
+from sklearn.metrics import (accuracy_score, classification_report,
+                             confusion_matrix, f1_score)
+from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
+                          Trainer, TrainingArguments, pipeline)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+PROJECT_DIR = Path(__file__).parent
+NEWS_CSV = PROJECT_DIR / "normalized_news_july_dec_2024.csv"
+OUT_DIR = PROJECT_DIR / "artifacts"
+OUT_DIR.mkdir(exist_ok=True)
+
+BASE_MODEL = "ahmedrachid/FinancialBERT-Sentiment-Analysis"
+ZERO_SHOT_MODEL = "facebook/bart-large-mnli"
+
+SEED = 42
+SAMPLE_SIZE = 3000          # headlines to pseudo-label
+CONFIDENCE_THRESHOLD = 0.65 # drop weak pseudo-labels below this
+EPOCHS = 3
+BATCH_SIZE = 16
+LR = 2e-5
+MAX_LEN = 64                # headlines are short
+FREEZE_LOWER_LAYERS = 6     # freeze bottom N encoder layers (0 = no freeze)
+
+LABELS = ["negative", "neutral", "positive"]
+LABEL2ID = {l: i for i, l in enumerate(LABELS)}
+ID2LABEL = {i: l for l, i in LABEL2ID.items()}
+
+# Descriptive hypothesis strings for zero-shot — wording matters a lot
+ZERO_SHOT_HYPOTHESES = {
+    "positive": "this headline signals positive news for financial markets",
+    "neutral":  "this headline is neutral or factual with no market impact",
+    "negative": "this headline signals negative news for financial markets",
+}
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DEVICE = 0 if torch.cuda.is_available() else -1
+print(f"[cfg] device: {'cuda' if DEVICE == 0 else 'cpu'}")
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Load news
+# ---------------------------------------------------------------------------
+def load_news() -> pd.DataFrame:
+    df = pd.read_csv(NEWS_CSV)
+    df["title"] = df["title"].astype(str).str.strip()
+    df = df[df["title"].str.len() > 10].copy()          # drop junk
+    df = df.drop_duplicates(subset="title").reset_index(drop=True)
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None).dt.date
+    print(f"[load] {len(df):,} unique headlines")
+    print(df["tags"].value_counts().head())
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Stratified sample across tag/source
+# ---------------------------------------------------------------------------
+def stratified_sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    # Group by tag so both "financial" and "political" are represented.
+    groups = df.groupby("tags", group_keys=False)
+    per_group = max(1, n // max(1, len(groups)))
+    sampled = groups.apply(
+        lambda g: g.sample(min(len(g), per_group), random_state=SEED)
+    ).reset_index(drop=True)
+    if len(sampled) > n:
+        sampled = sampled.sample(n, random_state=SEED).reset_index(drop=True)
+    print(f"[sample] {len(sampled)} rows; tag distribution:")
+    print(sampled["tags"].value_counts())
+    return sampled
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Zero-shot pseudo-labeling
+# ---------------------------------------------------------------------------
+def pseudo_label(texts: list[str]) -> tuple[list[str], list[float]]:
+    clf = pipeline(
+        "zero-shot-classification",
+        model=ZERO_SHOT_MODEL,
+        device=DEVICE,
+    )
+    hyp_list = [ZERO_SHOT_HYPOTHESES[l] for l in LABELS]
+    hyp_to_label = {ZERO_SHOT_HYPOTHESES[l]: l for l in LABELS}
+
+    labels_out, confs_out = [], []
+    BATCH = 32
+    for i in range(0, len(texts), BATCH):
+        batch = texts[i : i + BATCH]
+        outputs = clf(batch, candidate_labels=hyp_list, multi_label=False)
+        if isinstance(outputs, dict):      # single-item edge case
+            outputs = [outputs]
+        for out in outputs:
+            top_hyp = out["labels"][0]
+            labels_out.append(hyp_to_label[top_hyp])
+            confs_out.append(float(out["scores"][0]))
+        if (i // BATCH) % 10 == 0:
+            print(f"[zsl] {i + len(batch):>5}/{len(texts)}")
+    return labels_out, confs_out
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Tokenize and build train/val/test splits
+# ---------------------------------------------------------------------------
+def build_datasets(df_labeled: pd.DataFrame, tokenizer):
+    def tok(batch):
+        return tokenizer(
+            batch["title"],
+            padding="max_length",
+            truncation=True,
+            max_length=MAX_LEN,
+        )
+
+    df_labeled = df_labeled.copy()
+    df_labeled["label"] = df_labeled["pseudo_label"].map(LABEL2ID)
+    ds = Dataset.from_pandas(df_labeled[["title", "label"]], preserve_index=False)
+    ds = ds.map(tok, batched=True)
+
+    split = ds.train_test_split(test_size=0.2, seed=SEED, stratify_by_column="label")
+    val_test = split["test"].train_test_split(test_size=0.5, seed=SEED,
+                                              stratify_by_column="label")
+    return split["train"], val_test["train"], val_test["test"]
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — Fine-tune
+# ---------------------------------------------------------------------------
+def freeze_lower_layers(model, n: int):
+    if n <= 0:
+        return
+    frozen = 0
+    for name, p in model.named_parameters():
+        if "encoder.layer." in name:
+            layer_idx = int(name.split("encoder.layer.")[1].split(".")[0])
+            if layer_idx < n:
+                p.requires_grad = False
+                frozen += 1
+        if "embeddings" in name:
+            p.requires_grad = False
+            frozen += 1
+    print(f"[freeze] froze {frozen} tensors (layers < {n} + embeddings)")
+
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = logits.argmax(axis=-1)
+    return {
+        "accuracy": accuracy_score(labels, preds),
+        "f1_macro": f1_score(labels, preds, average="macro"),
+    }
+
+
+def fine_tune(train_ds, val_ds):
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        BASE_MODEL,
+        num_labels=len(LABELS),
+        id2label=ID2LABEL,
+        label2id=LABEL2ID,
+        ignore_mismatched_sizes=True,
+    )
+    freeze_lower_layers(model, FREEZE_LOWER_LAYERS)
+
+    args = TrainingArguments(
+        output_dir=str(OUT_DIR / "finbert-ft"),
+        num_train_epochs=EPOCHS,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE * 2,
+        learning_rate=LR,
+        warmup_ratio=0.1,
+        weight_decay=0.01,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="f1_macro",
+        greater_is_better=True,
+        logging_steps=25,
+        save_total_limit=1,
+        seed=SEED,
+        report_to="none",
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics,
+    )
+    trainer.train()
+    trainer.save_model(str(OUT_DIR / "finbert-ft-best"))
+    tokenizer.save_pretrained(str(OUT_DIR / "finbert-ft-best"))
+    return trainer, tokenizer
+
+
+# ---------------------------------------------------------------------------
+# Step 6 — Evaluate vs. off-the-shelf FinancialBERT
+# ---------------------------------------------------------------------------
+def evaluate_baseline(test_df: pd.DataFrame):
+    """Score the test set with out-of-the-box FinancialBERT."""
+    clf = pipeline(
+        "sentiment-analysis",
+        model=BASE_MODEL,
+        tokenizer=BASE_MODEL,
+        device=DEVICE,
+        truncation=True,
+        max_length=MAX_LEN,
+    )
+    # FinancialBERT returns labels like "positive"/"neutral"/"negative"
+    preds_raw = clf(test_df["title"].tolist(), batch_size=32)
+    preds = [p["label"].lower() for p in preds_raw]
+    preds_id = [LABEL2ID.get(p, LABEL2ID["neutral"]) for p in preds]
+    true_id = test_df["pseudo_label"].map(LABEL2ID).tolist()
+    return np.array(true_id), np.array(preds_id)
+
+
+def report_block(name, y_true, y_pred):
+    print(f"\n===== {name} =====")
+    print(classification_report(y_true, y_pred,
+                                target_names=LABELS, digits=3))
+    print("confusion matrix (rows=true, cols=pred):")
+    print(pd.DataFrame(
+        confusion_matrix(y_true, y_pred, labels=list(range(len(LABELS)))),
+        index=LABELS, columns=LABELS,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — Score all 21K headlines + daily aggregates
+# ---------------------------------------------------------------------------
+def score_all(df_all: pd.DataFrame, model_dir: str) -> pd.DataFrame:
+    clf = pipeline(
+        "sentiment-analysis",
+        model=model_dir,
+        tokenizer=model_dir,
+        device=DEVICE,
+        truncation=True,
+        max_length=MAX_LEN,
+        top_k=None,                 # return full prob distribution
+    )
+    titles = df_all["title"].tolist()
+    out = clf(titles, batch_size=64)
+
+    # Convert each prediction into a signed score in [-1, 1]
+    scores = []
+    best_labels = []
+    for dist in out:
+        probs = {d["label"].lower(): d["score"] for d in dist}
+        s = probs.get("positive", 0.0) - probs.get("negative", 0.0)
+        scores.append(s)
+        best_labels.append(max(probs, key=probs.get))
+
+    df_all = df_all.copy()
+    df_all["sent_score"] = scores
+    df_all["sent_label"] = best_labels
+    return df_all
+
+
+def daily_aggregate(df_scored: pd.DataFrame) -> pd.DataFrame:
+    def agg(group):
+        return pd.Series({
+            "sent_mean": group["sent_score"].mean(),
+            "sent_var":  group["sent_score"].var(ddof=0),
+            "headline_count": len(group),
+            "pos_share": (group["sent_label"] == "positive").mean(),
+            "neg_share": (group["sent_label"] == "negative").mean(),
+        })
+
+    df_scored = df_scored.copy()
+    df_scored["is_fin"] = df_scored["tags"].astype(str).str.contains("financial")
+    df_scored["is_pol"] = df_scored["tags"].astype(str).str.contains("political")
+
+    all_daily = df_scored.groupby("date").apply(agg).add_prefix("all_")
+    fin_daily = df_scored[df_scored.is_fin].groupby("date").apply(agg).add_prefix("fin_")
+    pol_daily = df_scored[df_scored.is_pol].groupby("date").apply(agg).add_prefix("pol_")
+
+    daily = all_daily.join(fin_daily, how="outer").join(pol_daily, how="outer")
+    daily.index = pd.to_datetime(daily.index)
+    daily = daily.sort_index()
+    return daily
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    # --- 1. Load ---
+    news = load_news()
+
+    # --- 2. Sample + 3. Pseudo-label ---
+    sample = stratified_sample(news, SAMPLE_SIZE)
+    labels, confs = pseudo_label(sample["title"].tolist())
+    sample["pseudo_label"] = labels
+    sample["pseudo_conf"] = confs
+
+    print("\n[pseudo] label distribution (all):")
+    print(sample["pseudo_label"].value_counts())
+
+    # Filter low-confidence pseudo-labels (noise reduction)
+    clean = sample[sample["pseudo_conf"] >= CONFIDENCE_THRESHOLD].copy()
+    print(f"\n[filter] kept {len(clean)}/{len(sample)} "
+          f"with conf ≥ {CONFIDENCE_THRESHOLD}")
+    print(clean["pseudo_label"].value_counts())
+
+    clean.to_csv(OUT_DIR / "pseudo_labeled_sample.csv", index=False)
+
+    # --- 4. Datasets ---
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    train_ds, val_ds, test_ds = build_datasets(clean, tokenizer)
+    print(f"[split] train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
+
+    # --- 5. Fine-tune ---
+    trainer, _ = fine_tune(train_ds, val_ds)
+
+    # --- 6. Evaluate on held-out test set ---
+    test_df = clean.iloc[test_ds["label"].__len__() * -1 :]  # approx; use ids below
+    # Proper extraction: rebuild test df from the Dataset's original rows.
+    test_df = pd.DataFrame({
+        "title": test_ds["title"],
+        "pseudo_label": [ID2LABEL[i] for i in test_ds["label"]],
+    })
+
+    # Fine-tuned predictions
+    ft_preds = trainer.predict(test_ds)
+    y_true_ft = ft_preds.label_ids
+    y_pred_ft = ft_preds.predictions.argmax(axis=-1)
+    report_block("Fine-tuned FinancialBERT", y_true_ft, y_pred_ft)
+
+    # Baseline predictions
+    y_true_b, y_pred_b = evaluate_baseline(test_df)
+    report_block("Baseline (off-the-shelf FinancialBERT)", y_true_b, y_pred_b)
+
+    # Ablation summary
+    ablation = pd.DataFrame({
+        "model": ["FinancialBERT (baseline)", "FinancialBERT (fine-tuned)"],
+        "accuracy": [accuracy_score(y_true_b, y_pred_b),
+                     accuracy_score(y_true_ft, y_pred_ft)],
+        "f1_macro": [f1_score(y_true_b, y_pred_b, average="macro"),
+                     f1_score(y_true_ft, y_pred_ft, average="macro")],
+    })
+    print("\n===== ABLATION =====")
+    print(ablation.to_string(index=False))
+    ablation.to_csv(OUT_DIR / "ablation_results.csv", index=False)
+
+    # --- 7. Score full corpus + daily aggregates ---
+    print("\n[score] running fine-tuned model on all headlines...")
+    best_model_dir = str(OUT_DIR / "finbert-ft-best")
+    news_scored = score_all(news, best_model_dir)
+    news_scored.to_csv(OUT_DIR / "news_scored.csv", index=False)
+
+    daily = daily_aggregate(news_scored)
+    daily.to_csv(OUT_DIR / "daily_sentiment.csv")
+    print(f"[done] wrote {OUT_DIR/'daily_sentiment.csv'} "
+          f"({len(daily)} days × {daily.shape[1]} features)")
+
+    print("\nNext: merge daily_sentiment.csv with BTC/GLD daily OHLCV, "
+          "engineer lag features, and train LogReg/RF/XGBoost per the proposal.")
+
+
+if __name__ == "__main__":
+    main()
