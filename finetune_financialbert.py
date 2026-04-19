@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from datasets import Dataset
+from datasets import ClassLabel, Dataset
 from sklearn.metrics import (accuracy_score, classification_report,
                              confusion_matrix, f1_score)
 from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
@@ -161,14 +161,31 @@ def build_datasets(df_labeled: pd.DataFrame, tokenizer):
         )
 
     df_labeled = df_labeled.copy()
-    df_labeled["label"] = df_labeled["pseudo_label"].map(LABEL2ID)
+
+    # If a class has too few samples to stratify across 3 splits, drop it
+    # and warn. (Zero-shot often underpredicts "neutral" on news headlines.)
+    MIN_PER_CLASS = 20
+    counts = df_labeled["pseudo_label"].value_counts()
+    tiny = counts[counts < MIN_PER_CLASS].index.tolist()
+    if tiny:
+        print(f"[build] dropping classes with <{MIN_PER_CLASS} samples: {tiny}")
+        df_labeled = df_labeled[~df_labeled["pseudo_label"].isin(tiny)].copy()
+
+    active_labels = [l for l in LABELS if l not in tiny]
+    active_l2i = {l: i for i, l in enumerate(active_labels)}
+    df_labeled["label"] = df_labeled["pseudo_label"].map(active_l2i)
+
     ds = Dataset.from_pandas(df_labeled[["title", "label"]], preserve_index=False)
+    # Cast label → ClassLabel so HF datasets can stratify on it
+    ds = ds.cast_column("label", ClassLabel(names=active_labels))
     ds = ds.map(tok, batched=True)
 
-    split = ds.train_test_split(test_size=0.2, seed=SEED, stratify_by_column="label")
+    split = ds.train_test_split(test_size=0.2, seed=SEED,
+                                stratify_by_column="label")
     val_test = split["test"].train_test_split(test_size=0.5, seed=SEED,
                                               stratify_by_column="label")
-    return split["train"], val_test["train"], val_test["test"]
+    print(f"[build] active classes: {active_labels}")
+    return split["train"], val_test["train"], val_test["test"], active_labels
 
 
 # ---------------------------------------------------------------------------
@@ -199,13 +216,15 @@ def compute_metrics(eval_pred):
     }
 
 
-def fine_tune(train_ds, val_ds):
+def fine_tune(train_ds, val_ds, active_labels):
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    id2label = {i: l for i, l in enumerate(active_labels)}
+    label2id = {l: i for i, l in id2label.items()}
     model = AutoModelForSequenceClassification.from_pretrained(
         BASE_MODEL,
-        num_labels=len(LABELS),
-        id2label=ID2LABEL,
-        label2id=LABEL2ID,
+        num_labels=len(active_labels),
+        id2label=id2label,
+        label2id=label2id,
         ignore_mismatched_sizes=True,
     )
     freeze_lower_layers(model, FREEZE_LOWER_LAYERS)
@@ -251,7 +270,7 @@ def fine_tune(train_ds, val_ds):
 # ---------------------------------------------------------------------------
 # Step 6 — Evaluate vs. off-the-shelf FinancialBERT
 # ---------------------------------------------------------------------------
-def evaluate_baseline(test_df: pd.DataFrame):
+def evaluate_baseline(test_df: pd.DataFrame, active_labels):
     """Score the test set with out-of-the-box FinancialBERT."""
     clf = pipeline(
         "sentiment-analysis",
@@ -261,22 +280,28 @@ def evaluate_baseline(test_df: pd.DataFrame):
         truncation=True,
         max_length=MAX_LEN,
     )
-    # FinancialBERT returns labels like "positive"/"neutral"/"negative"
+    l2i = {l: i for i, l in enumerate(active_labels)}
+    # Pick a fallback class for labels the baseline returns that we dropped
+    fallback = l2i.get("neutral", 0)
     preds_raw = clf(test_df["title"].tolist(), batch_size=32)
     preds = [p["label"].lower() for p in preds_raw]
-    preds_id = [LABEL2ID.get(p, LABEL2ID["neutral"]) for p in preds]
-    true_id = test_df["pseudo_label"].map(LABEL2ID).tolist()
+    preds_id = [l2i.get(p, fallback) for p in preds]
+    true_id = test_df["pseudo_label"].map(l2i).tolist()
     return np.array(true_id), np.array(preds_id)
 
 
-def report_block(name, y_true, y_pred):
+def report_block(name, y_true, y_pred, active_labels):
     print(f"\n===== {name} =====")
-    print(classification_report(y_true, y_pred,
-                                target_names=LABELS, digits=3))
+    print(classification_report(
+        y_true, y_pred,
+        labels=list(range(len(active_labels))),
+        target_names=active_labels,
+        digits=3, zero_division=0,
+    ))
     print("confusion matrix (rows=true, cols=pred):")
     print(pd.DataFrame(
-        confusion_matrix(y_true, y_pred, labels=list(range(len(LABELS)))),
-        index=LABELS, columns=LABELS,
+        confusion_matrix(y_true, y_pred, labels=list(range(len(active_labels)))),
+        index=active_labels, columns=active_labels,
     ))
 
 
@@ -365,27 +390,28 @@ def main():
 
     # --- 4. Datasets ---
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
-    train_ds, val_ds, test_ds = build_datasets(clean, tokenizer)
+    train_ds, val_ds, test_ds, active_labels = build_datasets(clean, tokenizer)
     print(f"[split] train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
 
     # --- 5. Fine-tune ---
-    trainer, _ = fine_tune(train_ds, val_ds)
+    trainer, _ = fine_tune(train_ds, val_ds, active_labels)
 
     # --- 6. Evaluate on held-out test set ---
     test_df = pd.DataFrame({
         "title": test_ds["title"],
-        "pseudo_label": [ID2LABEL[i] for i in test_ds["label"]],
+        "pseudo_label": [active_labels[i] for i in test_ds["label"]],
     })
 
     # Fine-tuned predictions
     ft_preds = trainer.predict(test_ds)
     y_true_ft = ft_preds.label_ids
     y_pred_ft = ft_preds.predictions.argmax(axis=-1)
-    report_block("Fine-tuned FinancialBERT", y_true_ft, y_pred_ft)
+    report_block("Fine-tuned FinancialBERT", y_true_ft, y_pred_ft, active_labels)
 
     # Baseline predictions
-    y_true_b, y_pred_b = evaluate_baseline(test_df)
-    report_block("Baseline (off-the-shelf FinancialBERT)", y_true_b, y_pred_b)
+    y_true_b, y_pred_b = evaluate_baseline(test_df, active_labels)
+    report_block("Baseline (off-the-shelf FinancialBERT)", y_true_b, y_pred_b,
+                 active_labels)
 
     # Ablation summary
     ablation = pd.DataFrame({
