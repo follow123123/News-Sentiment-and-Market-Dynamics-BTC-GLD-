@@ -47,13 +47,13 @@ BASE_MODEL = "ahmedrachid/FinancialBERT-Sentiment-Analysis"
 ZERO_SHOT_MODEL = "facebook/bart-large-mnli"
 
 SEED = 42
-SAMPLE_SIZE = 3000          # headlines to pseudo-label
+SAMPLE_SIZE = 5000          # M5 Pro / 48GB can easily handle more pseudo-labels
 CONFIDENCE_THRESHOLD = 0.65 # drop weak pseudo-labels below this
-EPOCHS = 3
-BATCH_SIZE = 16
+EPOCHS = 4                  # small model, plenty of headroom — watch val loss
+BATCH_SIZE = 64             # unified memory on M5 Pro: no issue
 LR = 2e-5
 MAX_LEN = 64                # headlines are short
-FREEZE_LOWER_LAYERS = 6     # freeze bottom N encoder layers (0 = no freeze)
+FREEZE_LOWER_LAYERS = 4     # with more data we can unfreeze more layers
 
 LABELS = ["negative", "neutral", "positive"]
 LABEL2ID = {l: i for i, l in enumerate(LABELS)}
@@ -70,8 +70,20 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-DEVICE = 0 if torch.cuda.is_available() else -1
-print(f"[cfg] device: {'cuda' if DEVICE == 0 else 'cpu'}")
+# Device selection: CUDA > MPS (Apple Silicon) > CPU
+# HF pipeline accepts: 0 (cuda), "mps", or -1 (cpu)
+if torch.cuda.is_available():
+    DEVICE = 0
+    DEVICE_NAME = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+    DEVICE_NAME = "mps"
+    # MPS fallback for ops not yet implemented in Metal
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+else:
+    DEVICE = -1
+    DEVICE_NAME = "cpu"
+print(f"[cfg] device: {DEVICE_NAME}")
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +224,11 @@ def fine_tune(train_ds, val_ds):
         save_total_limit=1,
         seed=SEED,
         report_to="none",
+        # Mac-friendly: fp16 is CUDA-only. MPS uses fp32 reliably.
+        fp16=torch.cuda.is_available(),
+        # Avoid spawning workers on Mac (fork issues with MPS)
+        dataloader_num_workers=0,
+        use_mps_device=torch.backends.mps.is_available(),
     )
 
     trainer = Trainer(
