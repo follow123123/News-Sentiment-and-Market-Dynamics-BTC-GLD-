@@ -250,7 +250,7 @@ def fine_tune(train_ds, val_ds, active_labels):
         fp16=torch.cuda.is_available(),
         # Avoid spawning workers on Mac (fork issues with MPS)
         dataloader_num_workers=0,
-        use_mps_device=torch.backends.mps.is_available(),
+        # Note: HF Trainer auto-detects MPS on Apple Silicon (>= transformers 4.30)
     )
 
     trainer = Trainer(
