@@ -105,11 +105,14 @@ def load_news() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def stratified_sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
     # Group by tag so both "financial" and "political" are represented.
-    groups = df.groupby("tags", group_keys=False)
-    per_group = max(1, n // max(1, len(groups)))
-    sampled = groups.apply(
-        lambda g: g.sample(min(len(g), per_group), random_state=SEED)
-    ).reset_index(drop=True)
+    # Use groupby().sample() — works across pandas versions and preserves columns.
+    tag_counts = df["tags"].value_counts()
+    per_group = max(1, n // max(1, len(tag_counts)))
+    parts = []
+    for tag, count in tag_counts.items():
+        take = min(count, per_group)
+        parts.append(df[df["tags"] == tag].sample(take, random_state=SEED))
+    sampled = pd.concat(parts, ignore_index=True)
     if len(sampled) > n:
         sampled = sampled.sample(n, random_state=SEED).reset_index(drop=True)
     print(f"[sample] {len(sampled)} rows; tag distribution:")
@@ -309,22 +312,26 @@ def score_all(df_all: pd.DataFrame, model_dir: str) -> pd.DataFrame:
 
 
 def daily_aggregate(df_scored: pd.DataFrame) -> pd.DataFrame:
-    def agg(group):
-        return pd.Series({
-            "sent_mean": group["sent_score"].mean(),
-            "sent_var":  group["sent_score"].var(ddof=0),
-            "headline_count": len(group),
-            "pos_share": (group["sent_label"] == "positive").mean(),
-            "neg_share": (group["sent_label"] == "negative").mean(),
-        })
-
     df_scored = df_scored.copy()
     df_scored["is_fin"] = df_scored["tags"].astype(str).str.contains("financial")
     df_scored["is_pol"] = df_scored["tags"].astype(str).str.contains("political")
+    df_scored["is_pos"] = (df_scored["sent_label"] == "positive").astype(int)
+    df_scored["is_neg"] = (df_scored["sent_label"] == "negative").astype(int)
 
-    all_daily = df_scored.groupby("date").apply(agg).add_prefix("all_")
-    fin_daily = df_scored[df_scored.is_fin].groupby("date").apply(agg).add_prefix("fin_")
-    pol_daily = df_scored[df_scored.is_pol].groupby("date").apply(agg).add_prefix("pol_")
+    def _agg(subset: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        g = subset.groupby("date")
+        out = pd.DataFrame({
+            f"{prefix}sent_mean": g["sent_score"].mean(),
+            f"{prefix}sent_var":  g["sent_score"].var(ddof=0),
+            f"{prefix}headline_count": g.size(),
+            f"{prefix}pos_share": g["is_pos"].mean(),
+            f"{prefix}neg_share": g["is_neg"].mean(),
+        })
+        return out
+
+    all_daily = _agg(df_scored,                       "all_")
+    fin_daily = _agg(df_scored[df_scored.is_fin],     "fin_")
+    pol_daily = _agg(df_scored[df_scored.is_pol],     "pol_")
 
     daily = all_daily.join(fin_daily, how="outer").join(pol_daily, how="outer")
     daily.index = pd.to_datetime(daily.index)
@@ -365,8 +372,6 @@ def main():
     trainer, _ = fine_tune(train_ds, val_ds)
 
     # --- 6. Evaluate on held-out test set ---
-    test_df = clean.iloc[test_ds["label"].__len__() * -1 :]  # approx; use ids below
-    # Proper extraction: rebuild test df from the Dataset's original rows.
     test_df = pd.DataFrame({
         "title": test_ds["title"],
         "pseudo_label": [ID2LABEL[i] for i in test_ds["label"]],
