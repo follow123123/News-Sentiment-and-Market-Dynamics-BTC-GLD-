@@ -253,14 +253,18 @@ def fine_tune(train_ds, val_ds, active_labels):
         # Note: HF Trainer auto-detects MPS on Apple Silicon (>= transformers 4.30)
     )
 
-    trainer = Trainer(
+    # transformers 5.x renamed `tokenizer` -> `processing_class`
+    trainer_kwargs = dict(
         model=model,
         args=args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        tokenizer=tokenizer,
         compute_metrics=compute_metrics,
     )
+    try:
+        trainer = Trainer(processing_class=tokenizer, **trainer_kwargs)
+    except TypeError:
+        trainer = Trainer(tokenizer=tokenizer, **trainer_kwargs)
     trainer.train()
     trainer.save_model(str(OUT_DIR / "finbert-ft-best"))
     tokenizer.save_pretrained(str(OUT_DIR / "finbert-ft-best"))
