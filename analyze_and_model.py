@@ -223,10 +223,13 @@ def make_models():
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
+    # Catch both missing package AND missing libomp on macOS (XGBoostError)
     try:
         from xgboost import XGBClassifier
         has_xgb = True
-    except ImportError:
+    except Exception as e:
+        print(f"[models] XGBoost unavailable ({type(e).__name__}); "
+              f"skipping. Install libomp on macOS: brew install libomp")
         has_xgb = False
 
     models = {
@@ -304,8 +307,8 @@ def feature_importance_plots(df: pd.DataFrame):
     import matplotlib.pyplot as plt
     try:
         from xgboost import XGBClassifier
-    except ImportError:
-        print("[importance] xgboost not installed — skipping")
+    except Exception as e:
+        print(f"[importance] xgboost unavailable ({type(e).__name__}) — skipping")
         return
 
     for asset, spike_col in [("BTC", "btc_spike"), ("GLD", "gld_spike")]:
