@@ -90,11 +90,53 @@ The fine-tuned model (~419 MB) is published as a GitHub Release — too
 large to commit directly. Download and extract into `artifacts/` to reuse
 without re-running the fine-tune step.
 
-## Next Steps
+## Results — 2×3 Matrix (Walk-Forward CV)
 
-- Merge `daily_sentiment.csv` with BTC / GLD daily OHLCV.
-- Label volatility spikes (|return| > 2σ above 30-day rolling mean).
-- Engineer lag features (1d / 3d / 7d rolling mean, momentum).
-- Run correlation + Granger causality tests.
-- Train LogReg / RF / XGBoost with walk-forward CV across
-  {BTC, GLD} × {financial only, political only, combined} — the 2×3 matrix.
+Produced by `analyze_and_model.py`. Best model per cell (LogReg / RF / XGBoost).
+All cells evaluated on the same 182 aligned daily rows (sentiment + BTC price);
+GLD cells use only trading days.
+
+### σ = 2.0 (strict: spike rate ~14%)
+
+| AUC | Financial only | Political only | Combined |
+|-----|---------------:|---------------:|---------:|
+| BTC | 0.608          | 0.538          | **0.631** |
+| GLD | 0.464          | 0.546          | 0.563 |
+
+### σ = 1.5 (lenient: spike rate ~20%)
+
+| AUC | Financial only | Political only | Combined |
+|-----|---------------:|---------------:|---------:|
+| BTC | **0.623**      | 0.490          | 0.569 |
+| GLD | 0.537          | 0.447          | 0.512 |
+
+### Interpretation
+
+- **Bitcoin has a modest but consistent sentiment signal.** Financial news
+  alone reaches AUC 0.61–0.62; combining all sentiment streams at σ=2.0
+  pushes to 0.63. Effect is small but robust across thresholds.
+- **Gold signal is near-chance.** No configuration clears AUC 0.57 for
+  GLD. Headline sentiment (especially from a corpus dominated by
+  cryptocurrency outlets) does not meaningfully predict gold volatility
+  over this six-month window.
+- **Political news on its own does not predict either asset.** The pol
+  stream is sparse (~8% of headlines) and may be too noisy day-to-day.
+  Its signal only appears when combined with financial sentiment for BTC.
+
+F1 scores are low (max 0.40) because spikes are rare by construction;
+AUC is the primary metric for this class imbalance.
+
+## Artifacts Generated
+
+```
+artifacts/
+├── merged_daily_sig2p0.csv, merged_daily_sig1p5.csv
+├── results_matrix_{f1,auc}_sig{2p0,1p5}.csv     ← 2×3 matrices
+├── results_full_sig{2p0,1p5}.csv                ← every model × cell
+├── granger_results_sig{2p0,1p5}.csv
+└── plots/
+    ├── price_vs_sentiment.png
+    ├── correlation_heatmap_sig{2p0,1p5}.png
+    ├── model_comparison_{btc,gld}_sig{2p0,1p5}.png
+    └── feature_importance_{btc,gld}_sig{2p0,1p5}.png
+```

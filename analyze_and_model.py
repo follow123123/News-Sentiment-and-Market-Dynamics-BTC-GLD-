@@ -17,6 +17,7 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import warnings
 from pathlib import Path
 
@@ -36,7 +37,7 @@ BTC_CSV = PROJECT_DIR / "bitcoin_prices_2024_4h.csv"
 GLD_CSV = PROJECT_DIR / "GLD_ETF_Stock_Price_History_Converted.csv"
 
 # --- modeling config ----------------------------------------------------------
-SPIKE_SIGMA = 2.0          # volatility spike: |return| > SIGMA * rolling std
+DEFAULT_SPIKE_SIGMA = 2.0  # volatility spike: |return| > SIGMA * rolling std
 ROLL_WINDOW = 30           # rolling stats window (days)
 LAGS = [1, 3, 7]           # rolling-mean windows for lag features
 WALK_FOLDS = 5             # TimeSeriesSplit folds
@@ -88,7 +89,8 @@ def load_gld_daily() -> pd.DataFrame:
 # =============================================================================
 # Stage 2 — Target labels
 # =============================================================================
-def add_targets(df: pd.DataFrame, close_col: str, vol_col: str, prefix: str):
+def add_targets(df: pd.DataFrame, close_col: str, vol_col: str, prefix: str,
+                sigma: float):
     ret = df[close_col].pct_change()
     abs_ret = ret.abs()
     roll_std = abs_ret.rolling(ROLL_WINDOW, min_periods=10).std()
@@ -97,8 +99,8 @@ def add_targets(df: pd.DataFrame, close_col: str, vol_col: str, prefix: str):
 
     df[f"{prefix}_return"] = ret
     df[f"{prefix}_abs_return"] = abs_ret
-    df[f"{prefix}_spike"] = (abs_ret > SPIKE_SIGMA * roll_std).astype(int)
-    df[f"{prefix}_surge"] = (df[vol_col] > roll_mean_vol + SPIKE_SIGMA * roll_std_vol).astype(int)
+    df[f"{prefix}_spike"] = (abs_ret > sigma * roll_std).astype(int)
+    df[f"{prefix}_surge"] = (df[vol_col] > roll_mean_vol + sigma * roll_std_vol).astype(int)
     return df
 
 
@@ -110,8 +112,20 @@ SENT_CORE = ["sent_mean", "sent_var", "headline_count", "pos_share", "neg_share"
 
 
 def engineer_lags(df: pd.DataFrame) -> pd.DataFrame:
-    """Add lag1, rolling means over LAGS, and momentum for every sentiment col."""
+    """Add lag1, rolling means over LAGS, and momentum for every sentiment col.
+
+    Impute NaN in sentiment columns with neutral defaults BEFORE computing
+    lags. Without this, any day with zero political headlines becomes NaN
+    for all pol_* features, and downstream dropna() wipes most rows.
+    """
     out = df.copy()
+    # Impute: sentiment means/variances/shares -> 0 (neutral), counts -> 0
+    for stream in SENT_STREAMS:
+        for feat in SENT_CORE:
+            col = f"{stream}_{feat}"
+            if col in out.columns:
+                out[col] = out[col].fillna(0.0)
+    # Now compute lags/rolls/momentum on the filled series
     for stream in SENT_STREAMS:
         for feat in SENT_CORE:
             col = f"{stream}_{feat}"
@@ -387,49 +401,78 @@ def model_comparison_plot(results: pd.DataFrame):
 # =============================================================================
 # Main
 # =============================================================================
-def main():
+def run_once(sigma: float, tag: str):
+    """Run the full pipeline at a given spike sigma. Outputs get `tag` suffix."""
     sent = load_sentiment()
     btc = load_btc_daily()
     gld = load_gld_daily()
 
-    # Outer-join sentiment + BTC (daily, 24/7), then left-join GLD (weekdays only).
     df = sent.join(btc, how="outer").join(gld, how="outer").sort_index()
-
-    # Targets
-    df = add_targets(df, "btc_close", "btc_volume", "btc")
-    df = add_targets(df, "gld_close", "gld_volume", "gld")
-
-    # Lag features
+    df = add_targets(df, "btc_close", "btc_volume", "btc", sigma)
+    df = add_targets(df, "gld_close", "gld_volume", "gld", sigma)
     df = engineer_lags(df)
 
-    # Save merged dataset for inspection
-    merged_path = ARTIFACTS / "merged_daily.csv"
+    btc_rate = df["btc_spike"].mean()
+    gld_rate = df["gld_spike"].mean()
+    print(f"\n[{tag}] spike rate: BTC={btc_rate:.1%}  GLD={gld_rate:.1%}")
+
+    merged_path = ARTIFACTS / f"merged_daily_{tag}.csv"
     df.to_csv(merged_path)
     print(f"[save] {merged_path.name} ({df.shape[0]} rows x {df.shape[1]} cols)")
 
-    # Stats
-    plot_correlation(df, PLOTS / "correlation_heatmap.png")
-    granger_table(df, ARTIFACTS / "granger_results.csv")
+    plot_correlation(df, PLOTS / f"correlation_heatmap_{tag}.png")
+    granger_table(df, ARTIFACTS / f"granger_results_{tag}.csv")
 
-    # Models — the 2x3 matrix
-    print("\n[models] training walk-forward CV across 2 assets x 3 feature sets x 3 models")
+    print(f"\n[{tag}] training walk-forward CV (2 assets x 3 feature sets x 3 models)")
     results = build_results_matrix(df)
-    results.to_csv(ARTIFACTS / "results_full.csv", index=False)
+    results.to_csv(ARTIFACTS / f"results_full_{tag}.csv", index=False)
 
     f1_mat = pretty_matrix(results, "f1")
     auc_mat = pretty_matrix(results, "auc")
-    f1_mat.to_csv(ARTIFACTS / "results_matrix_f1.csv")
-    auc_mat.to_csv(ARTIFACTS / "results_matrix_auc.csv")
+    f1_mat.to_csv(ARTIFACTS / f"results_matrix_f1_{tag}.csv")
+    auc_mat.to_csv(ARTIFACTS / f"results_matrix_auc_{tag}.csv")
 
-    print("\n===== 2x3 matrix — F1 (best model per cell) =====")
+    print(f"\n===== [{tag}] 2x3 matrix — F1 (best model per cell) =====")
     print(f1_mat.round(3).to_string())
-    print("\n===== 2x3 matrix — AUC (best model per cell) =====")
+    print(f"\n===== [{tag}] 2x3 matrix — AUC (best model per cell) =====")
     print(auc_mat.round(3).to_string())
 
-    # Plots
-    overlay_plots(df)
+    overlay_plots(df)  # asset-level plot, same regardless of sigma
     feature_importance_plots(df)
     model_comparison_plot(results)
+    # Re-tag the plots that depend on sigma
+    for name in ["feature_importance_btc", "feature_importance_gld",
+                 "model_comparison_btc", "model_comparison_gld"]:
+        src = PLOTS / f"{name}.png"
+        if src.exists():
+            src.rename(PLOTS / f"{name}_{tag}.png")
+
+    return {"sigma": sigma, "tag": tag,
+            "btc_spike_rate": btc_rate, "gld_spike_rate": gld_rate,
+            "f1_matrix": f1_mat, "auc_matrix": auc_mat}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sigmas", nargs="+", type=float,
+                        default=[DEFAULT_SPIKE_SIGMA, 1.5],
+                        help="Spike thresholds to sweep (in rolling-std units)")
+    args = parser.parse_args()
+
+    summaries = []
+    for sigma in args.sigmas:
+        tag = f"sig{sigma:.1f}".replace(".", "p")  # e.g. sig1p5, sig2p0
+        summaries.append(run_once(sigma, tag))
+
+    print("\n" + "=" * 60)
+    print("SWEEP SUMMARY")
+    print("=" * 60)
+    for s in summaries:
+        print(f"\nsigma = {s['sigma']:.1f}  "
+              f"(BTC spike rate {s['btc_spike_rate']:.1%}, "
+              f"GLD spike rate {s['gld_spike_rate']:.1%})")
+        print("AUC:")
+        print(s["auc_matrix"].round(3).to_string())
 
     print(f"\n[done] all outputs in {ARTIFACTS}/ and {PLOTS}/")
 
