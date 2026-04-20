@@ -377,6 +377,141 @@ def overlay_plots(df: pd.DataFrame):
     print(f"[plot] {path.name}")
 
 
+def granger_heatmap(granger_df: pd.DataFrame, path: Path):
+    """Heatmap of -log10(p) across (target, sentiment) x lag."""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    if granger_df.empty:
+        print("[plot] granger heatmap skipped (empty results)")
+        return
+    g = granger_df.copy()
+    g["row"] = g["target"] + " <- " + g["sentiment"]
+    pivot = g.pivot(index="row", columns="lag", values="p_value")
+    neglog = -np.log10(pivot.clip(lower=1e-6))
+
+    plt.figure(figsize=(8, max(4, 0.4 * len(pivot))))
+    sns.heatmap(neglog, annot=pivot.round(3), fmt="", cmap="viridis",
+                cbar_kws={"label": "-log10(p)"}, annot_kws={"size": 9})
+    plt.title("Granger causality (cell = raw p-value; color = -log10 p)\n"
+              "brighter = more significant; p<0.05 threshold = -log10(p) > 1.3")
+    plt.xlabel("Lag (days)")
+    plt.ylabel("target <- sentiment")
+    plt.tight_layout()
+    plt.savefig(path, dpi=130)
+    plt.close()
+    print(f"[plot] {path.name}")
+
+
+def roc_curves_plot(df: pd.DataFrame, results: pd.DataFrame, path_prefix: Path):
+    """One plot per asset, with ROC curves for all three feature sets overlaid."""
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import roc_curve
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    def best_model_factory(asset, fs_name):
+        sub = results[(results.asset == asset) & (results.feature_set == fs_name)]
+        if sub.empty:
+            return None
+        # Pick the model with highest AUC for this cell
+        mname = sub.sort_values("auc", ascending=False).iloc[0]["model"]
+        return mname
+
+    for asset, spike_col in [("BTC", "btc_spike"), ("GLD", "gld_spike")]:
+        plt.figure(figsize=(7, 6))
+        plt.plot([0, 1], [0, 1], "k--", alpha=0.4, label="chance")
+        any_plotted = False
+        for fs_name, streams in FEATURE_SETS.items():
+            cols = [c for c in feature_cols_for(streams) if c in df.columns]
+            data = df.dropna(subset=[spike_col])[cols + [spike_col]].dropna()
+            if len(data) < 40:
+                continue
+            X = data[cols].values
+            y = data[spike_col].values.astype(int)
+            if len(np.unique(y)) < 2:
+                continue
+            # Aggregate OOF predictions across walk-forward folds
+            tscv = TimeSeriesSplit(n_splits=WALK_FOLDS)
+            oof_y, oof_p = [], []
+            for tr, te in tscv.split(X):
+                if len(np.unique(y[tr])) < 2:
+                    continue
+                mdl = Pipeline([
+                    ("sc", StandardScaler()),
+                    ("lr", LogisticRegression(max_iter=1000, class_weight="balanced",
+                                              random_state=RANDOM_STATE)),
+                ])
+                mdl.fit(X[tr], y[tr])
+                oof_y.extend(y[te])
+                oof_p.extend(mdl.predict_proba(X[te])[:, 1])
+            if not oof_y or len(set(oof_y)) < 2:
+                continue
+            fpr, tpr, _ = roc_curve(oof_y, oof_p)
+            from sklearn.metrics import roc_auc_score
+            auc = roc_auc_score(oof_y, oof_p)
+            plt.plot(fpr, tpr, label=f"{fs_name} (AUC={auc:.2f})")
+            any_plotted = True
+        if not any_plotted:
+            plt.close()
+            continue
+        plt.xlabel("False positive rate")
+        plt.ylabel("True positive rate")
+        plt.title(f"{asset} spike prediction — ROC (walk-forward OOF, LogReg)")
+        plt.legend(loc="lower right")
+        plt.tight_layout()
+        out = Path(f"{path_prefix}_{asset.lower()}.png")
+        plt.savefig(out, dpi=130)
+        plt.close()
+        print(f"[plot] {out.name}")
+
+
+def spike_timeline_plot(df: pd.DataFrame, path: Path):
+    """Price time series with spike days marked and sentiment overlay."""
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
+
+    # Known event to annotate
+    events = {"2024-11-05": "US Election"}
+
+    for ax, (asset, close, spike, sent_col) in zip(axes, [
+        ("BTC", "btc_close", "btc_spike", "fin_sent_mean"),
+        ("GLD", "gld_close", "gld_spike", "pol_sent_mean"),
+    ]):
+        sub = df[[close, spike, sent_col]].dropna(subset=[close])
+        if sub.empty:
+            continue
+        ax.plot(sub.index, sub[close], color="black", lw=1.2, label=f"{asset} close")
+        # Mark spike days
+        spike_days = sub[sub[spike] == 1].index
+        for d in spike_days:
+            ax.axvline(d, color="red", alpha=0.25, lw=0.9)
+        # Sentiment overlay on second y-axis
+        ax2 = ax.twinx()
+        ax2.plot(sub.index, sub[sent_col].rolling(7).mean(),
+                 color="tab:blue", alpha=0.7, lw=1.1,
+                 label=f"{sent_col} (7d MA)")
+        ax2.set_ylabel("sentiment", color="tab:blue")
+        ax.set_ylabel(f"{asset} price")
+        ax.set_title(f"{asset} — price (black), sentiment 7d MA (blue), "
+                     f"spike days (red verticals)  |  "
+                     f"{int(sub[spike].sum())} spikes")
+        # Annotate known events
+        for date_str, label in events.items():
+            d = pd.to_datetime(date_str)
+            if sub.index.min() <= d <= sub.index.max():
+                ax.axvline(d, color="green", lw=1.5, ls="--", alpha=0.6)
+                ax.text(d, ax.get_ylim()[1] * 0.98, f" {label}",
+                        color="green", fontsize=9, va="top")
+    plt.tight_layout()
+    plt.savefig(path, dpi=130)
+    plt.close()
+    print(f"[plot] {path.name}")
+
+
 def model_comparison_plot(results: pd.DataFrame):
     import matplotlib.pyplot as plt
 
@@ -421,7 +556,9 @@ def run_once(sigma: float, tag: str):
     print(f"[save] {merged_path.name} ({df.shape[0]} rows x {df.shape[1]} cols)")
 
     plot_correlation(df, PLOTS / f"correlation_heatmap_{tag}.png")
-    granger_table(df, ARTIFACTS / f"granger_results_{tag}.csv")
+    g_df = granger_table(df, ARTIFACTS / f"granger_results_{tag}.csv")
+    granger_heatmap(g_df, PLOTS / f"granger_heatmap_{tag}.png")
+    spike_timeline_plot(df, PLOTS / f"spike_timeline_{tag}.png")
 
     print(f"\n[{tag}] training walk-forward CV (2 assets x 3 feature sets x 3 models)")
     results = build_results_matrix(df)
@@ -440,6 +577,7 @@ def run_once(sigma: float, tag: str):
     overlay_plots(df)  # asset-level plot, same regardless of sigma
     feature_importance_plots(df)
     model_comparison_plot(results)
+    roc_curves_plot(df, results, PLOTS / f"roc_{tag}")
     # Re-tag the plots that depend on sigma
     for name in ["feature_importance_btc", "feature_importance_gld",
                  "model_comparison_btc", "model_comparison_gld"]:
