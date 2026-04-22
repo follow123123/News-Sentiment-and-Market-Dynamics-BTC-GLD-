@@ -140,3 +140,58 @@ artifacts/
     ├── model_comparison_{btc,gld}_sig{2p0,1p5}.png
     └── feature_importance_{btc,gld}_sig{2p0,1p5}.png
 ```
+
+## Dedicated Correlation / Visualization / Interpretation Workflow
+
+To keep the section-specific work separate from the baseline scripts, this
+repo also includes:
+
+- `correlation_visualization_analysis.py` — runs a dedicated correlation,
+  visualization, and interpretation pass using the existing project pipeline
+  and writes isolated outputs.
+- `interpretation_summary.py` — turns those outputs into a concise text
+  summary for the write-up / speaking notes.
+- `correlation_visualization_methods_findings.txt` — section draft covering
+  methods, results, findings, and caveats.
+
+Run:
+
+```bash
+python correlation_visualization_analysis.py
+python interpretation_summary.py
+```
+
+Outputs are written to:
+
+```
+artifacts/correlation_visualization_interpretation/
+├── merged_daily_sig2p0.csv
+├── lagged_correlations_full_sig2p0.csv
+├── stream_target_correlations_sig2p0.csv
+├── top20_correlations_sig2p0.csv
+├── results_full_sig2p0.csv
+├── results_matrix_{auc,f1}_sig2p0.csv
+├── price_vs_sentiment_ablation_sig2p0.csv
+├── granger_with_adf_sig2p0.csv
+├── interpretation_snapshot_sig2p0.txt
+├── interpretation_summary.txt
+└── plots/
+    ├── correlation_heatmap_sig2p0.png
+    ├── stream_target_heatmap_sig2p0.png
+    ├── price_vs_sentiment_sig2p0.png
+    ├── spike_timeline_sig2p0.png
+    └── results_matrix_auc_sig2p0.png
+```
+
+### Section-level headline findings
+
+- **BTC shows a modest sentiment signal.** The best dedicated 2×3 cell is
+  BTC / Combined with **AUC 0.631**.
+- **GLD remains weak / near-chance.** Its best dedicated 2×3 cell reaches
+  only **AUC 0.563**.
+- **BTC sentiment signal is stronger than the price-only baseline in the
+  sentiment-only ablation.** BTC sentiment-only reaches **AUC 0.674**, versus
+  **0.640** for BTC price-only.
+- **The strongest rigorous statistical result is political sentiment leading
+  BTC volatility.** After ADF correction, the only significant Granger result
+  is `BTC_abs_return <- political sentiment` at lag 5 (`p = 0.0107`).

@@ -1,0 +1,95 @@
+Correlation, Visualization & Interpretation
+
+Methods
+
+1. Data used
+- I used the project's daily sentiment features from `artifacts/daily_sentiment.csv`, together with daily BTC and GLD price data.
+- BTC data was resampled from 4-hour candles to daily OHLCV.
+- GLD data was already daily and aligned by date with the sentiment table.
+
+2. Feature construction
+- Sentiment was analyzed in three streams: `all`, `fin`, and `pol`.
+- For each stream, I used lagged sentiment features, especially lag-1 sentiment means, to study whether previous-day sentiment related to next-day market movement.
+- I also used the project's spike labels, where a spike is defined using rolling volatility with sigma = 2.0.
+
+3. Correlation analysis
+- I computed Spearman correlations between lagged sentiment features and market outcomes:
+  BTC return, BTC absolute return, BTC spike, GLD return, GLD absolute return, and GLD spike.
+- I summarized both the full correlation table and a stream-level view focused on `*_sent_mean_lag1`.
+
+4. Visualization
+- I generated a correlation heatmap for lagged sentiment vs market outcomes.
+- I created a stream-target heatmap to compare all / financial / political sentiment against BTC and GLD outcomes.
+- I produced price-versus-sentiment overlays and spike timeline plots to visually compare market movement and sentiment changes over time.
+- I also generated an AUC heatmap from the 2x3 result matrix.
+
+5. Interpretation analysis
+- I reused the project's walk-forward evaluation framework with Logistic Regression, Random Forest, and XGBoost.
+- I compared Financial only, Political only, and Combined sentiment streams across BTC and GLD.
+- I also used the deeper-analysis setup:
+  price-only vs sentiment-only vs price+sentiment ablation,
+  and ADF-corrected Granger causality testing.
+
+Results
+
+1. Overall predictive strength
+- The strongest result in the main 2x3 matrix was BTC with Combined sentiment, which achieved AUC = 0.631.
+- This is above chance, but still only a modest signal.
+- GLD remained weaker overall, with its best AUC at 0.563 in the combined setting of the main matrix.
+
+2. Correlation patterns
+- The strongest BTC stream-level correlations were:
+  `fin_sent_mean_lag1` vs `btc_abs_return`: rho = -0.167
+  `fin_sent_mean_lag1` vs `btc_spike`: rho = -0.126
+  `all_sent_mean_lag1` vs `btc_spike`: rho = -0.111
+- These are small correlations, which suggests that sentiment is related to BTC movement, but only weakly.
+- The strongest GLD stream-level correlations were also small:
+  `all_sent_mean_lag1` vs `gld_return`: rho = -0.170
+  `pol_sent_mean_lag1` vs `gld_abs_return`: rho = 0.129
+  `all_sent_mean_lag1` vs `gld_abs_return`: rho = 0.127
+- This supports the conclusion that sentiment relationships for GLD are weak and inconsistent.
+
+3. Ablation findings
+- For BTC:
+  Sentiment only achieved the best AUC at 0.674 with XGBoost.
+  Price only achieved AUC 0.640.
+  Price + Sentiment dropped to AUC 0.582.
+- This suggests that sentiment does contain useful information for BTC, but combining sentiment with price features may have caused overfitting in this small sample.
+- For GLD:
+  Price only was best at AUC 0.591.
+  Price + Sentiment was 0.585.
+  Sentiment only was 0.563.
+- This suggests that sentiment adds little to GLD prediction in this dataset.
+
+4. Strongest statistical finding
+- After ADF stationarity correction, the only statistically significant Granger result was:
+  `BTC_abs_return <- political sentiment`, lag 5, p = 0.0107.
+- This means political sentiment appears to have predictive value for Bitcoin volatility at around a 5-day lag in this sample.
+- No comparable significant result appeared for GLD.
+
+Findings and Interpretation
+
+1. Bitcoin shows a modest sentiment signal
+- The evidence does not suggest a strong predictive model, but it does suggest that headline sentiment carries some information for BTC volatility.
+- The size of the effect is modest, so this should be described as weak-to-moderate predictive value rather than strong prediction.
+
+2. Gold does not show a convincing sentiment signal
+- GLD results stayed close to chance across the main setups.
+- This suggests that the headline sentiment features used in this project do not meaningfully predict gold volatility over this six-month window.
+
+3. Political sentiment matters more for BTC than expected
+- The most rigorous interpretation result was not about gold, but about Bitcoin:
+  political sentiment Granger-caused BTC absolute return at lag 5.
+- A plausible explanation is that the 2024 election cycle created political uncertainty that affected crypto markets more directly than gold in this sample.
+
+4. Important limitations
+- Correlations are small, so the visual/statistical relationships should not be overstated.
+- The time window is short and the sample is limited.
+- The news corpus is heavily crypto-skewed, which likely helps BTC more than GLD.
+- The sentiment labels are bootstrapped through foundation-model-based weak supervision rather than human annotation.
+
+Bottom line
+
+- BTC: modest but real sentiment-related signal.
+- GLD: weak or near-chance sentiment signal.
+- Strongest rigorous result: political sentiment predicts BTC volatility at a 5-day lag after stationarity correction.
