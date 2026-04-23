@@ -1,0 +1,23 @@
+{
+  "name": "news-sentiment-and-market-dynamics-btc-gld-",
+  "version": "1.0.0",
+  "description": "Predicting next-day volatility spikes in Bitcoin and Gold (GLD ETF) from\r news sentiment, July–December 2024.",
+  "main": "build_slides.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/follow123123/News-Sentiment-and-Market-Dynamics-BTC-GLD-.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/follow123123/News-Sentiment-and-Market-Dynamics-BTC-GLD-/issues"
+  },
+  "homepage": "https://github.com/follow123123/News-Sentiment-and-Market-Dynamics-BTC-GLD-#readme",
+  "dependencies": {
+    "pptxgenjs": "^4.0.1"
+  }
+}
